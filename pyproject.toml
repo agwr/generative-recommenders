@@ -1,0 +1,16 @@
+[project]
+name = "generative-recommenders"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "jaxtyping>=0.3.10",
+    "torch>=2.12.0",
+]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+extend-ignore = ["F722", "F821"]
