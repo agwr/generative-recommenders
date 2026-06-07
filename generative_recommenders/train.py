@@ -43,10 +43,6 @@ class GenerativeRecommendationTrainer:
         author_ids:  int64 Tensor [seq_len]
         engagements: float Tensor [seq_len, n_engagements]
     All items must share seq_len so the default collate can stack them.
-
-    Launch:
-        single-GPU: python train.py
-        multi-GPU:  torchrun --nproc_per_node=NGPU train.py
     """
 
     def __init__(
