@@ -7,12 +7,6 @@ from torch import Tensor
 
 
 def hash_multipliers(n: int) -> Tensor:
-    """
-    Deterministic odd int64 multipliers for k-hash ID embeddings. Multiplying an ID by an
-    odd constant before taking the bucket modulo decorrelates structured IDs; using k > 1
-    independent multipliers makes total collisions (all k buckets matching) rare.
-    """
-
     g = torch.Generator().manual_seed(0)
     return torch.randint(-(2**62), 2**62 - 1, (n,), generator=g, dtype=torch.int64) * 2 + 1
 
@@ -289,7 +283,6 @@ class GenerativeRecommendationModel(nn.Module):
         assert post_ids.shape == engagements.shape[:2], "engagements must align with post_ids on (batch, seq_len)"
         assert author_ids.shape == post_ids.shape, "author_ids must align with post_ids on (batch, seq_len)"
 
-        # Keep parameters in fp32, but run activation-heavy ops under bf16 autocast.
         with torch.autocast(device_type=post_ids.device.type, dtype=torch.bfloat16):
             # Multi-hash ID embeddings: each ID is summed across k independent bucket hashes,
             # so two IDs only collide when all k hashes match - collision damage decays in k.

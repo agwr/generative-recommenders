@@ -57,7 +57,7 @@ class GenerativeRecommendationTrainer:
         self.validate_schema(val_dataset, model_cfg)
         self.cfg = trainer_cfg
 
-        # torchrun sets these env vars; defaults collapse to world_size=1 so the
+        # torchrun sets these env vars - defaults collapse to world_size=1 so the
         # single-GPU path is structurally identical to the multi-GPU one.
         for k, v in {
             "MASTER_ADDR": "localhost",
@@ -131,7 +131,6 @@ class GenerativeRecommendationTrainer:
             for batch in self.train_loader:
                 losses = self.train_step(batch)
 
-                # Rank-0-only logging avoids interleaved output across processes.
                 if self.rank == 0 and self.step_idx % self.cfg.log_interval == 0:
                     total, post_ce, eng_bce = losses.tolist()
                     logger.info(
@@ -143,11 +142,8 @@ class GenerativeRecommendationTrainer:
                         eng_bce,
                     )
 
-                # Checkpoint write is rank-0-gated inside save_checkpoint.
                 self.save_checkpoint()
 
-                # All ranks must enter val_step together (collective all-reduce inside);
-                # only rank 0 prints the result.
                 if self.step_idx > 0 and self.step_idx % self.cfg.val_interval == 0:
                     total, post_ce, eng_bce = self.val_step().tolist()
                     if self.rank == 0:
