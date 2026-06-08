@@ -211,7 +211,7 @@ class GenerativeRecommendationModel(nn.Module):
         P_theta(p_t | p_<t, e_<t)
 
     where theta are the model weights, p_i is the post at position i, and e_i is the vector
-    of observed engagements on p_i (e_i is an input feature, not a prediction target).
+    of observed engagements on p_i.
 
     The surrogate objective is to recommend the post p* that maximizes weighted engagement:
 
