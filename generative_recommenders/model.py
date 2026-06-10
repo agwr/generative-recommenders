@@ -185,6 +185,29 @@ class Transformer(nn.Module):
         return self.final_norm(x)
 
 
+class HashedEmbedding(nn.Module):
+    """
+    Multi-hash ID embedding: an ID indexes k rows of a shared table via k independent
+    multiplicative hashes, and the k rows are fused into one d_model vector by a linear
+    projection. Two IDs only share a representation when all k hashes collide, so
+    collision damage decays in k.
+    """
+
+    multipliers: Tensor
+
+    def __init__(self, n_rows: int, n_hashes: int, d_model: int, bias: bool):
+        super().__init__()
+        assert n_hashes >= 1, "n_hashes must be >= 1"
+        self.n_rows = n_rows
+        self.table = nn.Embedding(n_rows, d_model)
+        self.proj = nn.Linear(n_hashes * d_model, d_model, bias=bias)
+        self.register_buffer("multipliers", hash_multipliers(n_hashes), persistent=False)
+
+    def forward(self, ids: Int[Tensor, "..."]) -> Float[Tensor, "... d_model"]:
+        buckets = (ids.unsqueeze(-1) * self.multipliers) % self.n_rows
+        return self.proj(self.table(buckets).flatten(-2))
+
+
 @dataclass
 class GenerativeRecommendationModelConfig(TransformerConfig):
     n_post_embeddings: int
@@ -215,45 +238,47 @@ class GenerativeRecommendationModel(nn.Module):
 
     The surrogate objective is to recommend the post p* that maximizes weighted engagement:
 
-        p* = argmax_p(Σ_j  w_j * r_j(p))
+        p* = argmax_p(sum_j  w_j * r_j(p))
 
     where r_j(p) is the engagement score for head j (favorited, replied, ...) and w_j
     is a tuned heuristic weighting.
     """
 
     engagement_priors: Tensor
-    id_hash_multipliers: Tensor
 
     def __init__(self, cfg: GenerativeRecommendationModelConfig):
         super().__init__()
         assert len(cfg.engagement_priors) == cfg.n_engagements, "engagement_priors length must match n_engagements"
-        assert cfg.n_id_hashes >= 1, "n_id_hashes must be >= 1"
-        self.n_post_embeddings = cfg.n_post_embeddings
-        self.n_author_embeddings = cfg.n_author_embeddings
         self.engagement_loss_weight = cfg.engagement_loss_weight
-        self.post_embedding = nn.Embedding(cfg.n_post_embeddings, cfg.d_model)
-        self.author_embedding = nn.Embedding(cfg.n_author_embeddings, cfg.d_model)
+        self.post_embedding = HashedEmbedding(cfg.n_post_embeddings, cfg.n_id_hashes, cfg.d_model, cfg.bias)
+        self.author_embedding = HashedEmbedding(cfg.n_author_embeddings, cfg.n_id_hashes, cfg.d_model, cfg.bias)
         self.engagement_proj = nn.Linear(cfg.n_engagements, cfg.d_model, bias=cfg.bias)
         self.transformer = Transformer(cfg)
         self.post_head = nn.Linear(cfg.d_model, cfg.d_model, bias=cfg.bias)
         self.engagement_head = nn.Linear(cfg.d_model, cfg.n_engagements, bias=cfg.bias)
         self.register_buffer("engagement_priors", torch.tensor(cfg.engagement_priors))
-        self.register_buffer("id_hash_multipliers", hash_multipliers(cfg.n_id_hashes), persistent=False)
 
     def loss(
         self,
-        post_logits: Float[Tensor, "batch seq_len n_post_embeddings"],
+        post_pred: Float[Tensor, "batch seq_len d_model"],
         eng_logits: Float[Tensor, "batch seq_len n_engagements"],
         post_ids: Int[Tensor, "batch seq_len"],
         engagements: Float[Tensor, "batch seq_len n_engagements"],
     ) -> GenerativeRecommendationModelLoss:
+        assert post_pred.shape[:2] == post_ids.shape, "loss requires decode_all=True predictions aligned with post_ids"
+        batch, seq_len = post_ids.shape
+
         # Teacher-forced next-step loss: output at position t predicts position t + 1, so
         # we drop the last prediction and align targets one step ahead.
-        post_logits, eng_logits = post_logits[:, :-1].float(), eng_logits[:, :-1].float()
-        target_buckets = ((post_ids[:, 1:] * self.id_hash_multipliers[0]) % self.n_post_embeddings).reshape(-1)
+        post_pred, eng_logits = post_pred[:, :-1].float(), eng_logits[:, :-1].float()
         target_engagements = engagements[:, 1:]
 
-        post_ce = F.cross_entropy(post_logits.reshape(-1, self.n_post_embeddings), target_buckets)
+        # Softmax over the sequence's own posts, so the catalog is never enumerated:
+        # position t must score the post at t + 1 above the rest of the sequence.
+        seq_post_emb = self.post_embedding(post_ids).float()
+        post_logits = post_pred @ seq_post_emb.transpose(1, 2)
+        target_idx = torch.arange(1, seq_len, device=post_ids.device).repeat(batch)
+        post_ce = F.cross_entropy(post_logits.reshape(-1, seq_len), target_idx)
         eng_bce_per_head = F.binary_cross_entropy_with_logits(eng_logits, target_engagements, reduction="none").mean(
             dim=(0, 1)
         )
@@ -277,28 +302,23 @@ class GenerativeRecommendationModel(nn.Module):
         engagements: Float[Tensor, "batch seq_len n_engagements"],
         decode_all: bool = False,
     ) -> tuple[
-        Float[Tensor, "batch decoded_seq_len n_post_embeddings"],
+        Float[Tensor, "batch decoded_seq_len d_model"],
         Float[Tensor, "batch seq_len n_engagements"],
     ]:
         assert post_ids.shape == engagements.shape[:2], "engagements must align with post_ids on (batch, seq_len)"
         assert author_ids.shape == post_ids.shape, "author_ids must align with post_ids on (batch, seq_len)"
 
         with torch.autocast(device_type=post_ids.device.type, dtype=torch.bfloat16):
-            # Multi-hash ID embeddings: each ID is summed across k independent bucket hashes,
-            # so two IDs only collide when all k hashes match - collision damage decays in k.
-            post_buckets = (post_ids.unsqueeze(-1) * self.id_hash_multipliers) % self.n_post_embeddings
-            author_buckets = (author_ids.unsqueeze(-1) * self.id_hash_multipliers) % self.n_author_embeddings
-            post_emb = self.post_embedding(post_buckets).sum(dim=-2)
-            author_emb = self.author_embedding(author_buckets).sum(dim=-2)
+            post_emb = self.post_embedding(post_ids)
+            author_emb = self.author_embedding(author_ids)
             eng_emb = self.engagement_proj(engagements)
             h = self.transformer(post_emb + author_emb + eng_emb)
 
             # Per-engagement scores: project output into unnormalized logit per engagement type.
             eng_scores = self.engagement_head(h)
 
-            # Post-ID retrieval: project h into post-embedding space and use dot-product similarity.
-            # Avoid cosine sim: it re-normalizes the full table every step and discards magnitude.
-            pred = self.post_head(h if decode_all else h[:, -1:])
-            post_logits = pred @ self.post_embedding.weight.t()
+            # Predicted next-post embedding: a post's score is the dot product between its
+            # fused embedding and this prediction.
+            post_pred = self.post_head(h if decode_all else h[:, -1:])
 
-        return post_logits, eng_scores
+        return post_pred, eng_scores

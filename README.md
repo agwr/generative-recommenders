@@ -17,7 +17,7 @@ Launch on 8 GPUs:
 ```bash
 uv run torchrun --nproc_per_node=8 generative_recommenders/train.py \
     --train-dataset path/to/train_shards/ \
-    --val-dataset   path/to/val_shards/ \
+    --val-dataset path/to/val_shards/ \
     --model-cfg.d-model 512 \
     --model-cfg.n-layers 8 \
     --trainer-cfg.batch-size 64 \

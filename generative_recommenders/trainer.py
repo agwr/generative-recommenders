@@ -75,8 +75,11 @@ class GenerativeRecommendationTrainer:
         torch.cuda.set_device(self.device)
 
         # Place the model on this rank's device, then wrap in DDP for gradient all-reduce.
+        # Compile after DDP wrapping so Dynamo's DDPOptimizer can split graphs at bucket
+        # boundaries and preserve comm/compute overlap.
         self.inner: GenerativeRecommendationModel = GenerativeRecommendationModel(model_cfg).to(self.device)
         self.model = DDP(self.inner, device_ids=[self.local_rank])
+        self.model.compile()
 
         # Train shuffles each epoch via set_epoch; val is shuffle=False so coverage is
         # deterministic and disjointly partitioned across ranks.
@@ -164,11 +167,11 @@ class GenerativeRecommendationTrainer:
         batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
 
         # Forward through self.model (the DDP wrapper) so the reducer schedules the next
-        # backward's gradient all-reduce. Loss math runs on the returned logits.
-        post_logits, eng_logits = self.model(
+        # backward's gradient all-reduce. Loss math runs on the returned predictions.
+        post_pred, eng_logits = self.model(
             batch["post_ids"], batch["author_ids"], batch["engagements"], decode_all=True
         )
-        loss = self.inner.loss(post_logits, eng_logits, batch["post_ids"], batch["engagements"])
+        loss = self.inner.loss(post_pred, eng_logits, batch["post_ids"], batch["engagements"])
 
         self.optimizer.zero_grad()
         loss.total.backward()
@@ -187,10 +190,10 @@ class GenerativeRecommendationTrainer:
         # Each rank sums losses over its disjoint val shard.
         for batch in self.val_loader:
             batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
-            post_logits, eng_logits = self.model(
+            post_pred, eng_logits = self.model(
                 batch["post_ids"], batch["author_ids"], batch["engagements"], decode_all=True
             )
-            loss = self.inner.loss(post_logits, eng_logits, batch["post_ids"], batch["engagements"])
+            loss = self.inner.loss(post_pred, eng_logits, batch["post_ids"], batch["engagements"])
             totals += torch.stack([loss.total, loss.post_ce, loss.engagement_bce])
 
         # Sum partial sums across ranks, then divide by the global batch count.
